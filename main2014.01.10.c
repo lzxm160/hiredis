@@ -1,0 +1,1127 @@
+#include "fmacros.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/time.h>
+#include <assert.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
+#include "hiredis.h"
+#include "conf.h"
+#include <mysql.h>
+#include "async.h"
+#include "adapters/ae.h"
+#define DEBUG
+/* Put event loop in the global scope, so it can be explicitly stopped */
+static aeEventLoop *loop;
+
+void getCallback(redisAsyncContext *c, void *r, void *privdata) {
+    redisReply *reply = r;
+    if (reply == NULL) return;
+    printf("argv[%s]: %s\n", (char*)privdata, reply->str);
+
+    /* Disconnect after receiving the reply to GET */
+    redisAsyncDisconnect(c);
+}
+
+void connectCallback(const redisAsyncContext *c, int status) {
+    if (status != REDIS_OK) {
+        printf("Error: %s\n", c->errstr);
+        aeStop(loop);
+        return;
+    }
+
+    printf("Connected...\n");
+}
+
+void disconnectCallback(const redisAsyncContext *c, int status) {
+    if (status != REDIS_OK) {
+        printf("Error: %s\n", c->errstr);
+        aeStop(loop);
+        return;
+    }
+
+    printf("Disconnected...\n");
+    aeStop(loop);
+}
+enum connection_type {
+    CONN_TCP,
+    CONN_UNIX
+};
+
+struct config {
+    enum connection_type type;
+
+    struct {
+        const char *host;
+        int port;
+        struct timeval timeout;
+    } tcp;
+
+    struct {
+        const char *path;
+    } unixl;
+};
+
+/* The following lines make up our testing "framework" :) */
+static int tests = 0, fails = 0;
+#define test(_s) { printf("#%02d ", ++tests); printf(_s); }
+#define test_cond(_c) if(_c) printf("\033[0;32mPASSED\033[0;0m\n"); else {printf("\033[0;31mFAILED\033[0;0m\n"); fails++;}
+
+static long long usec(void) {
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    return (((long long)tv.tv_sec)*1000000)+tv.tv_usec;
+}
+
+static redisContext *select_database(redisContext *c) {
+    redisReply *reply;
+
+    /* Switch to DB 9 for testing, now that we know we can chat. */
+    reply = redisCommand(c,"SELECT 9");
+    assert(reply != NULL);
+    freeReplyObject(reply);
+
+    /* Make sure the DB is emtpy */
+    reply = redisCommand(c,"DBSIZE");
+    assert(reply != NULL);
+    if (reply->type == REDIS_REPLY_INTEGER && reply->integer == 0) {
+        /* Awesome, DB 9 is empty and we can continue. */
+        freeReplyObject(reply);
+    } else {
+        printf("Database #9 is not empty, test can not continue\n");
+        exit(1);
+    }
+
+    return c;
+}
+
+static void disconnect(redisContext *c) {
+    redisReply *reply;
+
+    /* Make sure we're on DB 9. */
+    reply = redisCommand(c,"SELECT 9");
+    assert(reply != NULL);
+    freeReplyObject(reply);
+    reply = redisCommand(c,"FLUSHDB");
+    assert(reply != NULL);
+    freeReplyObject(reply);
+
+    /* Free the context as well. */
+    redisFree(c);
+}
+
+static redisContext *connect(struct config config) {
+    redisContext *c = NULL;
+
+    if (config.type == CONN_TCP) {
+        c = redisConnect(config.tcp.host, config.tcp.port);
+    } else if (config.type == CONN_UNIX) {
+        c = redisConnectUnix(config.unixl.path);
+    } else {
+        assert(NULL);
+    }
+
+    if (c == NULL) {
+        printf("Connection error: can't allocate redis context\n");
+        exit(1);
+    } else if (c->err) {
+        printf("Connection error: %s\n", c->errstr);
+        exit(1);
+    }
+
+    return select_database(c);
+}
+
+static void test_format_commands(void) {
+    char *cmd;
+    int len;
+
+    test("Format command without interpolation: ");
+    len = redisFormatCommand(&cmd,"SET foo bar");
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(3+2));
+    free(cmd);
+
+    test("Format command with %%s string interpolation: ");
+    len = redisFormatCommand(&cmd,"SET %s %s","foo","bar");
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(3+2));
+    free(cmd);
+
+    test("Format command with %%s and an empty string: ");
+    len = redisFormatCommand(&cmd,"SET %s %s","foo","");
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$0\r\n\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(0+2));
+    free(cmd);
+
+    test("Format command with an empty string in between proper interpolations: ");
+    len = redisFormatCommand(&cmd,"SET %s %s","","foo");
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$0\r\n\r\n$3\r\nfoo\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(0+2)+4+(3+2));
+    free(cmd);
+
+    test("Format command with %%b string interpolation: ");
+    len = redisFormatCommand(&cmd,"SET %b %b","foo",(size_t)3,"b\0r",(size_t)3);
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nb\0r\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(3+2));
+    free(cmd);
+
+    test("Format command with %%b and an empty string: ");
+    len = redisFormatCommand(&cmd,"SET %b %b","foo",(size_t)3,"",(size_t)0);
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$0\r\n\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(0+2));
+    free(cmd);
+
+    test("Format command with literal %%: ");
+    len = redisFormatCommand(&cmd,"SET %% %%");
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$1\r\n%\r\n$1\r\n%\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(1+2)+4+(1+2));
+    free(cmd);
+
+    /* Vararg width depends on the type. These tests make sure that the
+     * width is correctly determined using the format and subsequent varargs
+     * can correctly be interpolated. */
+#define INTEGER_WIDTH_TEST(fmt, type) do {                                                \
+    type value = 123;                                                                     \
+    test("Format command with printf-delegation (" #type "): ");                          \
+    len = redisFormatCommand(&cmd,"key:%08" fmt " str:%s", value, "hello");               \
+    test_cond(strncmp(cmd,"*2\r\n$12\r\nkey:00000123\r\n$9\r\nstr:hello\r\n",len) == 0 && \
+        len == 4+5+(12+2)+4+(9+2));                                                       \
+    free(cmd);                                                                            \
+} while(0)
+
+#define FLOAT_WIDTH_TEST(type) do {                                                       \
+    type value = 123.0;                                                                   \
+    test("Format command with printf-delegation (" #type "): ");                          \
+    len = redisFormatCommand(&cmd,"key:%08.3f str:%s", value, "hello");                   \
+    test_cond(strncmp(cmd,"*2\r\n$12\r\nkey:0123.000\r\n$9\r\nstr:hello\r\n",len) == 0 && \
+        len == 4+5+(12+2)+4+(9+2));                                                       \
+    free(cmd);                                                                            \
+} while(0)
+
+    INTEGER_WIDTH_TEST("d", int);
+    INTEGER_WIDTH_TEST("hhd", char);
+    INTEGER_WIDTH_TEST("hd", short);
+    INTEGER_WIDTH_TEST("ld", long);
+    INTEGER_WIDTH_TEST("lld", long long);
+    INTEGER_WIDTH_TEST("u", unsigned int);
+    INTEGER_WIDTH_TEST("hhu", unsigned char);
+    INTEGER_WIDTH_TEST("hu", unsigned short);
+    INTEGER_WIDTH_TEST("lu", unsigned long);
+    INTEGER_WIDTH_TEST("llu", unsigned long long);
+    FLOAT_WIDTH_TEST(float);
+    FLOAT_WIDTH_TEST(double);
+
+    test("Format command with invalid printf format: ");
+    len = redisFormatCommand(&cmd,"key:%08p %b",(void*)1234,"foo",(size_t)3);
+    test_cond(len == -1);
+
+    const char *argv[3];
+    argv[0] = "SET";
+    argv[1] = "foo\0xxx";
+    argv[2] = "bar";
+    size_t lens[3] = { 3, 7, 3 };
+    int argc = 3;
+
+    test("Format command by passing argc/argv without lengths: ");
+    len = redisFormatCommandArgv(&cmd,argc,argv,NULL);
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(3+2)+4+(3+2));
+    free(cmd);
+
+    test("Format command by passing argc/argv with lengths: ");
+    len = redisFormatCommandArgv(&cmd,argc,argv,lens);
+    test_cond(strncmp(cmd,"*3\r\n$3\r\nSET\r\n$7\r\nfoo\0xxx\r\n$3\r\nbar\r\n",len) == 0 &&
+        len == 4+4+(3+2)+4+(7+2)+4+(3+2));
+    free(cmd);
+}
+
+static void test_reply_reader(void) {
+    redisReader *reader;
+    void *reply;
+    int ret;
+    int i;
+
+    test("Error handling in reply parser: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"@foo\r\n",6);
+    ret = redisReaderGetReply(reader,NULL);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Protocol error, got \"@\" as reply type byte") == 0);
+    redisReaderFree(reader);
+
+    /* when the reply already contains multiple items, they must be free'd
+     * on an error. valgrind will bark when this doesn't happen. */
+    test("Memory cleanup in reply parser: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"*2\r\n",4);
+    redisReaderFeed(reader,(char*)"$5\r\nhello\r\n",11);
+    redisReaderFeed(reader,(char*)"@foo\r\n",6);
+    ret = redisReaderGetReply(reader,NULL);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Protocol error, got \"@\" as reply type byte") == 0);
+    redisReaderFree(reader);
+
+    test("Set error on nested multi bulks with depth > 7: ");
+    reader = redisReaderCreate();
+
+    for (i = 0; i < 9; i++) {
+        redisReaderFeed(reader,(char*)"*1\r\n",4);
+    }
+
+    ret = redisReaderGetReply(reader,NULL);
+    test_cond(ret == REDIS_ERR &&
+              strncasecmp(reader->errstr,"No support for",14) == 0);
+    redisReaderFree(reader);
+
+    test("Works with NULL functions for reply: ");
+    reader = redisReaderCreate();
+    reader->fn = NULL;
+    redisReaderFeed(reader,(char*)"+OK\r\n",5);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply == (void*)REDIS_REPLY_STATUS);
+    redisReaderFree(reader);
+
+    test("Works when a single newline (\\r\\n) covers two calls to feed: ");
+    reader = redisReaderCreate();
+    reader->fn = NULL;
+    redisReaderFeed(reader,(char*)"+OK\r",4);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply == NULL);
+    redisReaderFeed(reader,(char*)"\n",1);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply == (void*)REDIS_REPLY_STATUS);
+    redisReaderFree(reader);
+
+    test("Don't reset state after protocol error: ");
+    reader = redisReaderCreate();
+    reader->fn = NULL;
+    redisReaderFeed(reader,(char*)"x",1);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_ERR);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR && reply == NULL);
+    redisReaderFree(reader);
+
+    /* Regression test for issue #45 on GitHub. */
+    test("Don't do empty allocation for empty multi bulk: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"*0\r\n",4);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK &&
+        ((redisReply*)reply)->type == REDIS_REPLY_ARRAY &&
+        ((redisReply*)reply)->elements == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+}
+
+static void test_blocking_connection_errors(void) {
+    redisContext *c;
+
+    test("Returns error when host cannot be resolved: ");
+    c = redisConnect((char*)"idontexist.local", 6379);
+    test_cond(c->err == REDIS_ERR_OTHER &&
+        (strcmp(c->errstr,"Name or service not known") == 0 ||
+         strcmp(c->errstr,"Can't resolve: idontexist.local") == 0 ||
+         strcmp(c->errstr,"nodename nor servname provided, or not known") == 0 ||
+         strcmp(c->errstr,"no address associated with name") == 0));
+    redisFree(c);
+
+    test("Returns error when the port is not open: ");
+    c = redisConnect((char*)"localhost", 1);
+    test_cond(c->err == REDIS_ERR_IO &&
+        strcmp(c->errstr,"Connection refused") == 0);
+    redisFree(c);
+
+    test("Returns error when the unix socket path doesn't accept connections: ");
+    c = redisConnectUnix((char*)"/tmp/idontexist.sock");
+    test_cond(c->err == REDIS_ERR_IO); /* Don't care about the message... */
+    redisFree(c);
+}
+
+static void test_blocking_connection(struct config config) {
+    redisContext *c;
+    redisReply *reply;
+
+    c = connect(config);
+
+    test("Is able to deliver commands: ");
+    reply = redisCommand(c,"PING");
+    test_cond(reply->type == REDIS_REPLY_STATUS &&
+        strcasecmp(reply->str,"pong") == 0)
+    freeReplyObject(reply);
+
+    test("Is a able to send commands verbatim: ");
+    reply = redisCommand(c,"SET foo bar");
+    test_cond (reply->type == REDIS_REPLY_STATUS &&
+        strcasecmp(reply->str,"ok") == 0)
+    freeReplyObject(reply);
+
+    test("%%s String interpolation works: ");
+    reply = redisCommand(c,"SET %s %s","foo","hello world");
+    freeReplyObject(reply);
+    reply = redisCommand(c,"GET foo");
+    test_cond(reply->type == REDIS_REPLY_STRING &&
+        strcmp(reply->str,"hello world") == 0);
+    freeReplyObject(reply);
+
+    test("%%b String interpolation works: ");
+    reply = redisCommand(c,"SET %b %b","foo",(size_t)3,"hello\x00world",(size_t)11);
+    freeReplyObject(reply);
+    reply = redisCommand(c,"GET foo");
+    test_cond(reply->type == REDIS_REPLY_STRING &&
+        memcmp(reply->str,"hello\x00world",11) == 0)
+
+    test("Binary reply length is correct: ");
+    test_cond(reply->len == 11)
+    freeReplyObject(reply);
+
+    test("Can parse nil replies: ");
+    reply = redisCommand(c,"GET nokey");
+    test_cond(reply->type == REDIS_REPLY_NIL)
+    freeReplyObject(reply);
+
+    /* test 7 */
+    test("Can parse integer replies: ");
+    reply = redisCommand(c,"INCR mycounter");
+    test_cond(reply->type == REDIS_REPLY_INTEGER && reply->integer == 1)
+    freeReplyObject(reply);
+
+    test("Can parse multi bulk replies: ");
+    freeReplyObject(redisCommand(c,"LPUSH mylist foo"));
+    freeReplyObject(redisCommand(c,"LPUSH mylist bar"));
+    reply = redisCommand(c,"LRANGE mylist 0 -1");
+    test_cond(reply->type == REDIS_REPLY_ARRAY &&
+              reply->elements == 2 &&
+              !memcmp(reply->element[0]->str,"bar",3) &&
+              !memcmp(reply->element[1]->str,"foo",3))
+    freeReplyObject(reply);
+
+    /* m/e with multi bulk reply *before* other reply.
+     * specifically test ordering of reply items to parse. */
+    test("Can handle nested multi bulk replies: ");
+    freeReplyObject(redisCommand(c,"MULTI"));
+    freeReplyObject(redisCommand(c,"LRANGE mylist 0 -1"));
+    freeReplyObject(redisCommand(c,"PING"));
+    reply = (redisCommand(c,"EXEC"));
+    test_cond(reply->type == REDIS_REPLY_ARRAY &&
+              reply->elements == 2 &&
+              reply->element[0]->type == REDIS_REPLY_ARRAY &&
+              reply->element[0]->elements == 2 &&
+              !memcmp(reply->element[0]->element[0]->str,"bar",3) &&
+              !memcmp(reply->element[0]->element[1]->str,"foo",3) &&
+              reply->element[1]->type == REDIS_REPLY_STATUS &&
+              strcasecmp(reply->element[1]->str,"pong") == 0);
+    freeReplyObject(reply);
+
+    disconnect(c);
+}
+
+static void test_blocking_io_errors(struct config config) {
+    redisContext *c;
+    redisReply *reply;
+    void *_reply;
+    int major, minor;
+
+    /* Connect to target given by config. */
+    c = connect(config);
+    {
+        /* Find out Redis version to determine the path for the next test */
+        const char *field = "redis_version:";
+        char *p, *eptr;
+
+        reply = redisCommand(c,"INFO");
+        p = strstr(reply->str,field);
+        major = strtol(p+strlen(field),&eptr,10);
+        p = eptr+1; /* char next to the first "." */
+        minor = strtol(p,&eptr,10);
+        freeReplyObject(reply);
+    }
+
+    test("Returns I/O error when the connection is lost: ");
+    reply = redisCommand(c,"QUIT");
+    if (major >= 2 && minor > 0) {
+        /* > 2.0 returns OK on QUIT and read() should be issued once more
+         * to know the descriptor is at EOF. */
+        test_cond(strcasecmp(reply->str,"OK") == 0 &&
+            redisGetReply(c,&_reply) == REDIS_ERR);
+        freeReplyObject(reply);
+    } else {
+        test_cond(reply == NULL);
+    }
+
+    /* On 2.0, QUIT will cause the connection to be closed immediately and
+     * the read(2) for the reply on QUIT will set the error to EOF.
+     * On >2.0, QUIT will return with OK and another read(2) needed to be
+     * issued to find out the socket was closed by the server. In both
+     * conditions, the error will be set to EOF. */
+    assert(c->err == REDIS_ERR_EOF &&
+        strcmp(c->errstr,"Server closed the connection") == 0);
+    redisFree(c);
+
+    c = connect(config);
+    test("Returns I/O error on socket timeout: ");
+    struct timeval tv = { 0, 1000 };
+    assert(redisSetTimeout(c,tv) == REDIS_OK);
+    test_cond(redisGetReply(c,&_reply) == REDIS_ERR &&
+        c->err == REDIS_ERR_IO && errno == EAGAIN);
+    redisFree(c);
+}
+
+static void test_invalid_timeout_errors(struct config config) {
+    redisContext *c;
+
+    test("Set error when an invalid timeout usec value is given to redisConnectWithTimeout: ");
+
+    config.tcp.timeout.tv_sec = 0;
+    config.tcp.timeout.tv_usec = 10000001;
+
+    c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.tcp.timeout);
+
+    test_cond(c->err == REDIS_ERR_IO);
+
+    test("Set error when an invalid timeout sec value is given to redisConnectWithTimeout: ");
+
+    config.tcp.timeout.tv_sec = (((LONG_MAX) - 999) / 1000) + 1;
+    config.tcp.timeout.tv_usec = 0;
+
+    c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.tcp.timeout);
+
+    test_cond(c->err == REDIS_ERR_IO);
+
+    redisFree(c);
+}
+
+static void test_throughput(struct config config) {
+    redisContext *c = connect(config);
+    redisReply **replies;
+    int i, num;
+    long long t1, t2;
+
+    test("Throughput:\n");
+    for (i = 0; i < 500; i++)
+        freeReplyObject(redisCommand(c,"LPUSH mylist foo"));
+
+    num = 1000;
+    replies = malloc(sizeof(redisReply*)*num);
+    t1 = usec();
+    for (i = 0; i < num; i++) {
+        replies[i] = redisCommand(c,"PING");
+        assert(replies[i] != NULL && replies[i]->type == REDIS_REPLY_STATUS);
+    }
+    t2 = usec();
+    for (i = 0; i < num; i++) freeReplyObject(replies[i]);
+    free(replies);
+    printf("\t(%dx PING: %.3fs)\n", num, (t2-t1)/1000000.0);
+
+    replies = malloc(sizeof(redisReply*)*num);
+    t1 = usec();
+    for (i = 0; i < num; i++) {
+        replies[i] = redisCommand(c,"LRANGE mylist 0 499");
+        assert(replies[i] != NULL && replies[i]->type == REDIS_REPLY_ARRAY);
+        assert(replies[i] != NULL && replies[i]->elements == 500);
+    }
+    t2 = usec();
+    for (i = 0; i < num; i++) freeReplyObject(replies[i]);
+    free(replies);
+    printf("\t(%dx LRANGE with 500 elements: %.3fs)\n", num, (t2-t1)/1000000.0);
+
+    num = 10000;
+    replies = malloc(sizeof(redisReply*)*num);
+    for (i = 0; i < num; i++)
+        redisAppendCommand(c,"PING");
+    t1 = usec();
+    for (i = 0; i < num; i++) {
+        assert(redisGetReply(c, (void*)&replies[i]) == REDIS_OK);
+        assert(replies[i] != NULL && replies[i]->type == REDIS_REPLY_STATUS);
+    }
+    t2 = usec();
+    for (i = 0; i < num; i++) freeReplyObject(replies[i]);
+    free(replies);
+    printf("\t(%dx PING (pipelined): %.3fs)\n", num, (t2-t1)/1000000.0);
+
+    replies = malloc(sizeof(redisReply*)*num);
+    for (i = 0; i < num; i++)
+        redisAppendCommand(c,"LRANGE mylist 0 499");
+    t1 = usec();
+    for (i = 0; i < num; i++) {
+        assert(redisGetReply(c, (void*)&replies[i]) == REDIS_OK);
+        assert(replies[i] != NULL && replies[i]->type == REDIS_REPLY_ARRAY);
+        assert(replies[i] != NULL && replies[i]->elements == 500);
+    }
+    t2 = usec();
+    for (i = 0; i < num; i++) freeReplyObject(replies[i]);
+    free(replies);
+    printf("\t(%dx LRANGE with 500 elements (pipelined): %.3fs)\n", num, (t2-t1)/1000000.0);
+
+    disconnect(c);
+}
+
+// static long __test_callback_flags = 0;
+// static void __test_callback(redisContext *c, void *privdata) {
+//     ((void)c);
+//     /* Shift to detect execution order */
+//     __test_callback_flags <<= 8;
+//     __test_callback_flags |= (long)privdata;
+// }
+//
+// static void __test_reply_callback(redisContext *c, redisReply *reply, void *privdata) {
+//     ((void)c);
+//     /* Shift to detect execution order */
+//     __test_callback_flags <<= 8;
+//     __test_callback_flags |= (long)privdata;
+//     if (reply) freeReplyObject(reply);
+// }
+//
+// static redisContext *__connect_nonblock() {
+//     /* Reset callback flags */
+//     __test_callback_flags = 0;
+//     return redisConnectNonBlock("127.0.0.1", port, NULL);
+// }
+//
+// static void test_nonblocking_connection() {
+//     redisContext *c;
+//     int wdone = 0;
+//
+//     test("Calls command callback when command is issued: ");
+//     c = __connect_nonblock();
+//     redisSetCommandCallback(c,__test_callback,(void*)1);
+//     redisCommand(c,"PING");
+//     test_cond(__test_callback_flags == 1);
+//     redisFree(c);
+//
+//     test("Calls disconnect callback on redisDisconnect: ");
+//     c = __connect_nonblock();
+//     redisSetDisconnectCallback(c,__test_callback,(void*)2);
+//     redisDisconnect(c);
+//     test_cond(__test_callback_flags == 2);
+//     redisFree(c);
+//
+//     test("Calls disconnect callback and free callback on redisFree: ");
+//     c = __connect_nonblock();
+//     redisSetDisconnectCallback(c,__test_callback,(void*)2);
+//     redisSetFreeCallback(c,__test_callback,(void*)4);
+//     redisFree(c);
+//     test_cond(__test_callback_flags == ((2 << 8) | 4));
+//
+//     test("redisBufferWrite against empty write buffer: ");
+//     c = __connect_nonblock();
+//     test_cond(redisBufferWrite(c,&wdone) == REDIS_OK && wdone == 1);
+//     redisFree(c);
+//
+//     test("redisBufferWrite against not yet connected fd: ");
+//     c = __connect_nonblock();
+//     redisCommand(c,"PING");
+//     test_cond(redisBufferWrite(c,NULL) == REDIS_ERR &&
+//               strncmp(c->error,"write:",6) == 0);
+//     redisFree(c);
+//
+//     test("redisBufferWrite against closed fd: ");
+//     c = __connect_nonblock();
+//     redisCommand(c,"PING");
+//     redisDisconnect(c);
+//     test_cond(redisBufferWrite(c,NULL) == REDIS_ERR &&
+//               strncmp(c->error,"write:",6) == 0);
+//     redisFree(c);
+//
+//     test("Process callbacks in the right sequence: ");
+//     c = __connect_nonblock();
+//     redisCommandWithCallback(c,__test_reply_callback,(void*)1,"PING");
+//     redisCommandWithCallback(c,__test_reply_callback,(void*)2,"PING");
+//     redisCommandWithCallback(c,__test_reply_callback,(void*)3,"PING");
+//
+//     /* Write output buffer */
+//     wdone = 0;
+//     while(!wdone) {
+//         usleep(500);
+//         redisBufferWrite(c,&wdone);
+//     }
+//
+//     /* Read until at least one callback is executed (the 3 replies will
+//      * arrive in a single packet, causing all callbacks to be executed in
+//      * a single pass). */
+//     while(__test_callback_flags == 0) {
+//         assert(redisBufferRead(c) == REDIS_OK);
+//         redisProcessCallbacks(c);
+//     }
+//     test_cond(__test_callback_flags == 0x010203);
+//     redisFree(c);
+//
+//     test("redisDisconnect executes pending callbacks with NULL reply: ");
+//     c = __connect_nonblock();
+//     redisSetDisconnectCallback(c,__test_callback,(void*)1);
+//     redisCommandWithCallback(c,__test_reply_callback,(void*)2,"PING");
+//     redisDisconnect(c);
+//     test_cond(__test_callback_flags == 0x0201);
+//     redisFree(c);
+// }
+int GetRequestLogNewName(char *RequestLogNewName)
+{//这个是获得requestlog位置及名字：/F5_log/request_log/history_log/201401060920.log
+	  struct tm  *ptm;
+		long   ts;
+		int    y,m,d,h,n,s;
+		ts = time(NULL);
+		ptm = localtime(&ts);
+		y = ptm->tm_year+1900;  //年
+		m = ptm->tm_mon+1;      //月
+		d = ptm->tm_mday;       //日
+		h = ptm->tm_hour;       //时
+		n = ptm->tm_min;        //分
+		s = ptm->tm_sec;        //秒
+		//requestlog位置及名字：/F5_log/request_log/history_log/201401060920.log
+		if(n%5==0)//每5分钟
+		{
+			sprintf(RequestLogNewName,"%d%02d%02d%02d%02d.log",y,m,d,h,n);	
+			return 0;
+	  }
+	  else
+	  {
+	  	return -1;  		
+	  }
+	
+}
+int GetF5LogLocationNewName(char* F5LogNewLocation,char* F5LogNewName)
+{//这个是获得f5日志位置及名字：
+	///F5_log/2014_5m/20140109/2014010916/caccess_f5_20140109_1625.log
+	  struct tm  *ptm;
+		long   ts;
+		int    y,m,d,h,n,s;
+		ts = time(NULL);
+		ptm = localtime(&ts);
+		y = ptm->tm_year+1900;  //年
+		m = ptm->tm_mon+1;      //月
+		d = ptm->tm_mday;       //日
+		h = ptm->tm_hour;       //时
+		n = ptm->tm_min;        //分
+		s = ptm->tm_sec;        //秒
+		if(n%5==0)//每5分钟
+		{			
+			sprintf(F5LogNewLocation,"%d_5m/%d%02d%02d/%d%02d%02d%02d/",y,y,m,d,y,m,d,h);
+			sprintf(F5LogNewName,"caccess_f5_%d%02d%02d_%02d%02d.log",y,m,d,h,n);	
+			return 0;
+	  }
+	  else
+	  {
+	  	return -1;  		
+	  }
+	
+}
+int del_str_line(char *str)
+{/*
+    char *p = str;
+    while(('\n'||'\r')!= *p)
+    {
+        p++;
+        if(*p == '\0') //最后一行EOF不包含\n
+            return 0;
+    }
+    *p = '\0';
+ 
+    return 0;*/
+    for(;*str!=0;str++)
+    	{if(*str=='\n'||*str=='\r')
+    		{	
+    			*str='\0';
+  				return 0;
+  			}
+    	}
+    	return 0;
+}
+int main(int argc, char **argv) {
+	
+	//程序成为Daemon
+	//1、读配置，找到需要分析ip的日志，及F5的日志位置
+	//if ip module ipmodule处理
+	//if sql模块  sql模块处理   //后面加什么模块就转到相应模块处理
+	//ip和url需要联动，首先找出ip访问最多的，然后再在其中找出哪个url最多，在mysql中找到相应的表
+	//2、解析日志
+	//3、存入redis中
+	//4、redis信息定时放入mysql中
+	
+	
+	//程序成为Daemon
+	
+	// if(daemon(1,1)<0)
+    //    exit(-1);  //先注释掉便于调试
+	
+	char RequestLogLocation[100]={0};//5分钟切一次，可以分析出ip访问量，然后存入到redis中
+	char F5LogLocation[100]={0};//分析更多详细信息
+	char ip[16]={0};
+	//1、读取配置///////////////////////////////////////////
+	
+	if(GetProfileString("./cls.conf", "loglocation", "request_log", RequestLogLocation)==-1)
+	{	 
+			printf("request_log error\n");
+	   	exit(-1);
+	}
+	printf("request_log location:%s\n",RequestLogLocation);
+	
+	if(GetProfileString("./cls.conf", "loglocation", "F5_log", F5LogLocation)==-1)
+	{		
+			printf("F5LogLocation error\n");
+	   	exit(-1);
+	}
+	printf("F5_log location:%s\n",F5LogLocation);
+
+  if(GetProfileString("./cls.conf", "ip", "top", ip)==-1)
+	{
+		printf("ip error\n");
+		exit(-1);
+	}
+  printf("ip:%s\n",ip);
+  
+  ////////////////////////////////连接redis开始
+
+    unsigned int j;
+    redisContext *c;
+    redisReply *reply;
+    struct config cfg = {
+        .tcp = {
+            .host = "127.0.0.1",
+            .port = 6379
+        },
+        .unixl = {
+            .path = "/tmp/redis.sock"
+        }
+    };
+    int throughput = 1;
+    
+
+    // Ignore broken pipe signal (for I/O error tests). 
+    signal(SIGPIPE, SIG_IGN);
+
+    // Parse command line options. 
+    argv++; argc--;
+    while (argc) {
+        if (argc >= 2 && !strcmp(argv[0],"-h")) {
+            argv++; argc--;
+            cfg.tcp.host = argv[0];
+        } else if (argc >= 2 && !strcmp(argv[0],"-p")) {
+            argv++; argc--;
+            cfg.tcp.port = atoi(argv[0]);
+        } else if (argc >= 2 && !strcmp(argv[0],"-s")) {
+            argv++; argc--;
+            cfg.unixl.path = argv[0];
+        } else if (argc >= 1 && !strcmp(argv[0],"--skip-throughput")) {
+            throughput = 0;
+        } else {
+            fprintf(stderr, "Invalid argument: %s\n", argv[0]);
+            exit(1);
+        }
+        argv++; argc--;
+    }
+    
+    struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+    c = redisConnectWithTimeout(cfg.tcp.host, cfg.tcp.port, timeout);
+    if (c == NULL || c->err) {
+        if (c) {
+            printf("Connection error: %s\n", c->errstr);
+            redisFree(c);
+        } else {
+            printf("Connection error: can't allocate redis context\n");
+        }
+        exit(1);
+    }
+ 		// PING server
+    reply = redisCommand(c,"PING");
+    printf("PING: %s\n", reply->str);
+    freeReplyObject(reply);
+    
+
+
+///////////////////////连接redis结束///////////////////////////////////////////////
+//////////////////////连接mysql开始////////////////////////////////////////////////
+char Server[20]={0};
+char DataBase[30]={0};
+char User[20]={0};
+char Password[20]={0};
+char Table[20]={0};
+if(GetProfileString("./cls.conf", "mysql", "server", Server)==-1)
+	{	 
+			printf("Server error\n");
+	   	exit(-1);
+	}
+	#ifdef DEBUG
+	printf("Server:%s\n",Server);
+	#endif
+	if(GetProfileString("./cls.conf", "mysql", "database", DataBase)==-1)
+	{		
+			printf("DataBase error\n");
+	   	exit(-1);
+	}
+	#ifdef DEBUG
+	printf("DataBase:%s\n",DataBase);
+	#endif
+	if(GetProfileString("./cls.conf", "mysql", "table", Table)==-1)
+	{		
+			printf("Table error\n");
+	   	exit(-1);
+	}
+	#ifdef DEBUG
+	printf("Table:%s\n",Table);
+	#endif
+  if(GetProfileString("./cls.conf", "mysql", "user", User)==-1)
+	{
+		printf("User error\n");
+		exit(-1);
+	}
+	#ifdef DEBUG
+  printf("User:%s\n",User);
+	#endif
+  if(GetProfileString("./cls.conf", "mysql", "password", Password)==-1)
+	{
+		printf("Password error\n");
+		exit(-1);
+	}
+	#ifdef DEBUG
+  printf("Password:%s\n",Password);
+	#endif
+///////////////////开始连接mysql
+    MYSQL *conn_ptr=NULL;  
+    MYSQL_RES *res_ptr=NULL;  
+    MYSQL_ROW sqlrow=0;  
+    MYSQL_FIELD *fd=NULL;  
+    int res=0, i=0, jj=0;  
+  
+    conn_ptr = mysql_init(NULL);  
+    if (!conn_ptr) {  
+        return EXIT_FAILURE;  
+    }  
+    conn_ptr = mysql_real_connect(conn_ptr, Server, User, Password, DataBase, 0, NULL, 0);  
+    if (conn_ptr) {  
+    	
+        printf("Connection mysql success\n");
+    } else {  
+        printf("Connection mysql failed\n");  
+    }  
+     
+
+			
+
+//////////////////////连接mysql结束//////////////////////////////////////////////////
+
+  
+	//变量及配置解析放大循环外面
+	char RequestLogNewName[100]={0};
+	char RequestLogName[100]={0};
+	char F5LogNewLocation[100]={0};
+	char F5LogNewName[100]={0};
+	char F5LogName[100]={0};	
+	char cmdip[256]={0};
+	char cmdall[256]={0};
+	char Rediscmdip[256]={0};
+	char Rediscmdall[256]={0};
+	FILE *stream;//用于获得bash脚本的输出
+	FILE *streamSearchF5;
+	char buf[1024]={0};//用于存储从stream中读取的数据，即bash脚本执行的结果
+	char SmallBuf[30]={0};
+	char streamSearchF5buf[1024]={0};
+	for(;;)//整个大循环
+		{
+	//2、解析日志///////////////////////////////////
+	//
+	/*ALL=`cat $1 | wc -l`;
+	CM=`cat $1 |awk -F ' ' '{print $5}'|awk -F ',' '{print $1}' |awk -F ':' '{if($2=="ChinaMobile"){print $2}}' |wc -l`;
+	CT=`cat $1 |awk -F ' ' '{print $5}'|awk -F ',' '{print $1}' |awk -F ':' '{if($2=="ChinaTelecom"){print $2}}' |wc -l`;
+	Other=$[ALL-CM-CT];
+	echo all:$ALL;
+	echo cm:$CM;
+	echo ct:$CT;
+	echo other:$Other;
+		*/
+		//先拼凑一个文件名RequestLogNewName，判断是否跟上次解析的文件名RequestLogName相同，相同就不再第二次解析，不相同则解析，最后把RequestLogNewName strcpy给RequestLogName
+		memset(RequestLogNewName,0,sizeof(RequestLogNewName));
+		memset(F5LogNewName,0,sizeof(F5LogNewName));
+		if(!GetRequestLogNewName(RequestLogNewName))
+		{
+			printf("RequestLogNewName=%s\n",RequestLogNewName);
+		}
+		else
+		{
+			printf("get RequestLogNewName error,sleep 5 sec!\n");
+			sleep(5);
+			continue;
+		}
+		if(!GetF5LogLocationNewName(F5LogNewLocation,F5LogNewName))
+		{
+			printf("F5LogNewName=%s/%s/%s\n",F5LogLocation,F5LogNewLocation,F5LogNewName);
+		}
+		else
+		{
+			printf("get F5LogNewName error,sleep 5 sec!\n");
+			sleep(5);
+			continue;
+		}	
+		if(strcmp(RequestLogNewName,RequestLogName)!=0)//有新文件并未解析过
+		{ //新文件名生成，但实际文件有可能还未生成，需sleep(4),实际文件是5分或10分过2、3秒后生成的。
+			sleep(4);
+			memset(cmdip,0,sizeof(cmdip));
+			sprintf(cmdip, "bash ip.sh %s%s",RequestLogLocation,RequestLogNewName);//解析出ip及count
+			printf("cmdip=%s\n",cmdip);	
+    	//system(cmdip);
+    	stream=popen(cmdip,"r");
+    	/*
+                        	{
+                        	fread(buf,sizeof(char),sizeof(buf),stream);
+                        	printf("%s\n",buf);
+                        	/////////////存入redis
+                        	// Set a key 
+                        printf("before trim:\nzadd ipset:%s%s\n",RequestLogNewName,buf);
+                        //去掉回车换行多余空格
+                        int i=0;
+                        for(i=0;buf[i]!=0;i++)
+                        {
+                        	//32是空格，13是回车，10是换行，9是tab
+                        	//if(buf[i]==32||buf[i]==13||buf[i]==10||buf[i]==9)
+                        	if(buf[i]==13||buf[i]==10||buf[i]==9)
+                        		buf[i]=buf[i+1];
+                        		
+                        }
+                        //buf[i]=0;
+                        printf("after trim:\nzadd ipset:%s%s\n",RequestLogNewName,buf);
+                        memset(Rediscmdip,0,sizeof(Rediscmdip));
+                        sprintf(Rediscmdip,"zadd ipset:%s%s",RequestLogNewName,buf);
+                        
+                        printf("Rediscmdip:%d\n%s\n",strlen(Rediscmdip),Rediscmdip);
+                        }	
+    */
+      char *buff[2] = {0}; 
+     	for (int i = 0; i < atoi(ip); i++) 
+     	{  
+     		memset(SmallBuf,0,sizeof(SmallBuf)); 
+     		if(fgets(buf,30,stream) != NULL)//从stream中读取一行，992 222.73.133.32
+       {
+       	//去掉换行符
+        del_str_line(buf);
+        //将992 222.73.133.32拆分成两个字符串      
+        
+        buff[0] = strtok(buf," " );  
+        buff[1] = strtok(NULL," ");
+       
+        /*
+        for(int j=0;j<3;j++)
+        {
+        	buff[j]=strtok(NULL," ");
+        	printf("buf[%d]=%s\n",j,buff[j]);
+        	if(buff[j]==NULL) break;
+        }*/
+        //////////////////////////////////////////////
+         /* 
+        while( result != NULL )  
+        {  
+            printf( "result is \"%s\"\n", result );  
+            result = strtok( NULL, " " );  
+        }  */
+        
+        printf("zadd ipset:%s %s %s\n",RequestLogNewName,buff[0],buff[1]);
+        //使用已经连接好的redis上下文,将count 和ip写入redis的sorted set中
+        reply = redisCommand(c,"zadd ipset:%s %s %s",RequestLogNewName,buff[0],buff[1]);
+        printf("zadd: %s\n", reply->str);
+        freeReplyObject(reply);
+      //将前10ip对应的f5日志条目筛选出来。直接分析access_f5.log
+        
+        //在这里将ip前10的f5日志条目保存到redis里，无论分析5分钟还是1小时的，在日志切割的时候总会丢掉一些
+      memset(cmdip,0,sizeof(cmdip));
+      //获得系统时间，拼出目录和文件名，
+      ///F5_log/2014_5m/20140109/2014010916/caccess_f5_20140109_1615.log
+      sprintf(cmdip, "nohup bash SearchIpInF5.sh %s%s%s %s",F5LogLocation,F5LogNewLocation,F5LogNewName,buff[1]);//解析出ip及count
+			printf("searchipinf5=%s\n",cmdip);	
+    	//system(cmdip);
+    	streamSearchF5=popen(cmdip,"r");
+    	
+       //得到的流是基于前20个ip的url信息，例子如下： 
+       // 101.226.180.132 [08/Jan/2014:11:11:22 +0800] /login?URL=%2Fdiskall%2Fdownloadfile.php%3Ffileid%3D2707567%26type%3DEclass%26diskid%3D46783 http://www.yiban.cn/eclass/home.php?id=46783
+        //将信息放入redis里保存，最终存储到mysql中
+     // for(int i=0;fgets(streamSearchF5buf,1024,streamSearchF5) != NULL,i<3;i++)//逐一分析每一条
+      for(;fgets(streamSearchF5buf,1024,streamSearchF5) != NULL;)
+      {
+      	del_str_line(streamSearchF5buf);
+      	 //对每一条得到的条目拆分，得到这个条目的“分钟”，获得5分钟内的东西放入redis
+      	 
+      	 //printf("lpush iplist%s:%s %s",buff[1],RequestLogNewName,streamSearchF5buf);
+        //使用已经连接好的redis上下文,将count 和ip写入redis的sorted set中
+        
+        //在streamSearchF5buf中增加url对应的数据库表信息,
+        
+        ///////////mysql中查找url对应表信息-start
+        res = mysql_query(conn_ptr, "select * from mysql_log"); //查询语句  
+        if (res) {         
+            printf("SELECT error:%s\n",mysql_error(conn_ptr));     
+        } else {        
+            res_ptr = mysql_store_result(conn_ptr);             //取出结果集  
+            if(res_ptr) {               
+                printf("%lu Rows\n",(unsigned long)mysql_num_rows(res_ptr));   
+                jj = mysql_num_fields(res_ptr);  //表的列，6列
+                printf("%d columns\n",jj);
+                      
+                while((sqlrow = mysql_fetch_row(res_ptr)))  {   //依次取出记录  
+                    //for(i = 0; i < jj; i++)  
+                    #ifdef DEBUG       
+                        printf("%s\t", sqlrow[i]);              //输出  
+                    printf("\n"); 
+                    
+                    sleep(2);    
+                    #endif    
+                }              
+                if (mysql_errno(conn_ptr)) {                      
+                    fprintf(stderr,"Retrive error:s\n",mysql_error(conn_ptr));               
+                }        
+            }        
+            mysql_free_result(res_ptr);        
+        }  
+         ///////////mysql中查找url对应表信息-end
+        
+        
+        
+        
+        
+        ////////////写入redis
+        reply = redisCommand(c,"lpush iplist%s:%s %s",RequestLogNewName,buff[1],streamSearchF5buf);
+        //printf("lpush: %s\n", reply->str);
+        freeReplyObject(reply);
+      }  
+      /////////////////////////////////////////////////////////////////////  
+        
+        
+        
+        memset(buff[0],0,sizeof(buff[0]));
+        memset(buff[1],0,sizeof(buff[1]));
+        buff[0]=NULL;
+        buff[1]=NULL;
+       
+       
+       }
+      }
+     	fclose(streamSearchF5);
+    	fclose(stream);
+    	mysql_close(conn_ptr); 
+    
+    	strcpy(RequestLogName,RequestLogNewName);//解析过的新文件名复制到旧的里面保存
+    	printf("RequestLogNewName=%s\n",RequestLogNewName);
+    	printf("RequestLogName=%s\n",RequestLogName);
+    	sleep(250);//解析完一次，250s后再继续
+    	
+    	
+    	//对筛选出来的结果统计url前10，然后再在相应表里查找对应的数据库表
+    	
+    }
+    else//还是老文件并已经解析过
+    {    	
+    	continue;
+    }
+    
+	
+sleep(5);
+}
+ 
+
+    /* Disconnects and frees the context */
+    redisFree(c);
+		
+    return 0;
+}

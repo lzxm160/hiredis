@@ -1,7 +1,7 @@
 #ifndef __HIREDIS_AE_H__
 #define __HIREDIS_AE_H__
 #include <sys/types.h>
-#include <ae.h>
+#include "../ae.h"
 #include "../hiredis.h"
 #include "../async.h"
 
